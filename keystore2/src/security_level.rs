@@ -20,8 +20,10 @@ use crate::audit_log::{
 };
 use crate::database::{BlobInfo, CertificateInfo, KeyIdGuard};
 use crate::error::{
-    self, into_logged_binder, map_km_error, wrapped_rkpd_error_to_ks_error, Error, ErrorCode,
+    self, into_logged_binder, map_binder_status, map_binder_status_code, map_km_error,
+    wrapped_rkpd_error_to_ks_error, Error, ErrorCode,
 };
+use android_security_compat::aidl::android::security::compat::IKeystoreCompatService::IKeystoreCompatService;
 use crate::globals::{
     get_remotely_provisioned_component_name, DB, ENFORCEMENTS, LEGACY_IMPORTER, SUPER_KEY,
 };
@@ -224,6 +226,51 @@ impl KeystoreSecurityLevel {
             authorizations: crate::utils::key_parameters_to_authorizations(key_parameters),
             modificationTimeMs: creation_date.to_millis_epoch(),
         })
+    }
+
+    /// FundamentalOS: forge a software-backed key + keybox-signed attestation for a device-ID
+    /// attestation request (mirrors TrickyStoreOSS CertificateGen.generateKeyPair). The key is
+    /// generated on the software KeyMint so subsequent operations (sign) run in software; the
+    /// attestation extension is forged to claim this security level with deviceLocked/Verified.
+    #[allow(dead_code)]
+    fn forge_software_key(
+        &self,
+        params: &[KeyParameter],
+        ctx: &crate::attest_spoof::SpoofCtx,
+        uid: u32,
+    ) -> Result<KeyCreationResult> {
+        // keymint_service_name() errors for SOFTWARE, so get_keymint_device(SOFTWARE) never reaches
+        // the compat fallback. Go straight to the km_compat software KeyMint here.
+        keystore2_km_compat::add_keymint_device_service();
+        let compat: Strong<dyn IKeystoreCompatService> =
+            map_binder_status_code(binder::get_interface("android.security.compat"))
+                .context(ks_err!("Connecting to compat service for software forge."))?;
+        let sw_km = map_binder_status(compat.getKeyMintDevice(SecurityLevel::SOFTWARE))
+            .context(ks_err!("Getting software KeyMint from compat service."))?;
+        let sw_params = crate::attest_spoof::software_keygen_params(params);
+        let mut result = map_km_error({
+            let _wp =
+                self.watch("KeystoreSecurityLevel::forge_software_key: calling software generateKey");
+            sw_km.generateKey(&sw_params, None)
+        })
+        .context(ks_err!("Software KeyMint generateKey failed."))?;
+        let sw_leaf = result
+            .certificateChain
+            .first()
+            .ok_or_else(Error::sys)
+            .context(ks_err!("Software key produced no certificate."))?
+            .encodedCertificate
+            .clone();
+        let forged =
+            // Forge at the requested security level (matches what TrickyStoreOSS produces when it
+            // intercepts the same request — DroidGuard requests TEE for its attestation key).
+            crate::attest_spoof::forge_cert(&sw_leaf, ctx, self.security_level.0 as i64, uid)
+                .ok_or_else(Error::sys)
+                .context(ks_err!("forge_cert failed."))?;
+        result.certificateChain =
+            forged.into_iter().map(|der| Certificate { encodedCertificate: der }).collect();
+        crate::attest_spoof::patch_forge_characteristics(&mut result, ctx, self.security_level);
+        Ok(result)
     }
 
     fn create_operation(
@@ -554,6 +601,36 @@ impl KeystoreSecurityLevel {
         // Must return on error for security reasons.
         check_key_permission(KeyPerm::Rebind, &key, &None).context(ks_err!())?;
 
+        // Check the ORIGINAL request, including device-ID permissions, before the
+        // scoped reply adapter derives the request sent to KeyMint.
+        let params = self
+            .add_required_parameters(caller_uid, params, &key)
+            .context(ks_err!("Trying to get aaid."))?;
+        // FundamentalOS: keystore2's appId provider only emits GMS's current signer; rebuild it with
+        // GMS's full signing history before KeyMint so the resulting attestation matches what Google
+        // validates (this was the only field that differed from a TrickyStoreOSS-forged leaf).
+        let params = crate::attest_spoof::augment_app_id(&params);
+        let spoof_ctx = crate::attest_spoof::capture(caller_uid.0 as u32, &params);
+        // FundamentalOS: device-ID attestation is rejected by real KeyMint (CANNOT_ATTEST_IDS), and
+        // leaf-hacking a real key drags in the RKP-failing hardware path DroidGuard can observe.
+        // Forge a software-backed key + keybox attestation instead (mirrors TrickyStoreOSS forge).
+        if let Some(ctx) = spoof_ctx.as_ref() {
+            if crate::attest_spoof::wants_device_id_attestation(&params) {
+                match self.forge_software_key(&params, ctx, caller_uid.0 as u32) {
+                    Ok(creation_result) => {
+                        let user = caller_uid.owning_user();
+                        return self
+                            .store_new_key(key, creation_result, user, Some(flags))
+                            .context(ks_err!("Storing forged software-backed key."));
+                    }
+                    Err(e) => {
+                        log::error!("attest_spoof: software forge failed ({e:?}); using real KeyMint")
+                    }
+                }
+            }
+        }
+        let params = crate::attest_spoof::keymint_params(&params, spoof_ctx.as_ref());
+
         let attestation_key_info = match (key.domain, attest_key_descriptor) {
             (Domain::BLOB, _) => None,
             _ => DB
@@ -562,18 +639,14 @@ impl KeystoreSecurityLevel {
                         &key,
                         caller_uid,
                         attest_key_descriptor,
-                        params,
+                        &params,
                         &self.rem_prov_state,
                         &mut db.borrow_mut(),
                     )
                 })
                 .context(ks_err!("Trying to get an attestation key"))?,
         };
-        let params = self
-            .add_required_parameters(caller_uid, params, &key)
-            .context(ks_err!("Trying to get aaid."))?;
-
-        let creation_result = match attestation_key_info {
+        let mut creation_result = match attestation_key_info {
             Some(AttestationKeyInfo::UserGenerated {
                 key_id_guard,
                 blob,
@@ -679,6 +752,14 @@ impl KeystoreSecurityLevel {
         }
         .context(ks_err!())?;
 
+        // FundamentalOS: observe-only dump of REAL KeyMint attestation for OBSERVE_PATH uids.
+        crate::attest_spoof::observe_dump(caller_uid.0 as u32, &creation_result);
+
+        // FundamentalOS: selective per-app keybox attestation substitution (Play Integrity DEVICE).
+        // FundamentalOS: synthesize keybox attestation for targeted uids.
+        if let Some(ctx) = &spoof_ctx {
+            crate::attest_spoof::synthesize(&mut creation_result, ctx, caller_uid.0 as u32);
+        }
         let user = caller_uid.owning_user();
         self.store_new_key(key, creation_result, user, Some(flags)).context(ks_err!())
     }
@@ -1053,8 +1134,11 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         operation_parameters: &[KeyParameter],
         forced: bool,
     ) -> binder::Result<CreateOperationResponse> {
+        crate::attest_spoof::ks_trace(&format!("createOperation(secLvl={}, alias={:?}, purposes={:?})", self.security_level.0, key.alias, operation_parameters.iter().filter(|p| p.tag == Tag::PURPOSE).map(|p| format!("{:?}", p.value)).collect::<Vec<_>>()), ThreadState::get_calling_uid());
         let _wp = self.watch("IKeystoreSecurityLevel::createOperation");
-        self.create_operation(key, operation_parameters, forced).map_err(into_logged_binder)
+        let r = self.create_operation(key, operation_parameters, forced);
+        crate::attest_spoof::ks_trace(&format!("  -> createOperation ok={}", r.is_ok()), ThreadState::get_calling_uid());
+        r.map_err(into_logged_binder)
     }
     fn generateKey(
         &self,
@@ -1064,6 +1148,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         flags: i32,
         entropy: &[u8],
     ) -> binder::Result<KeyMetadata> {
+        crate::attest_spoof::ks_trace(&format!("generateKey(secLvl={}, alias={:?}, attKey={})", self.security_level.0, key.alias, attestation_key.is_some()), ThreadState::get_calling_uid());
         // Duration is set to 5 seconds, because generateKey - especially for RSA keys, takes more
         // time than other operations
         let _wp = self.watch_millis("IKeystoreSecurityLevel::generateKey", 5000);
@@ -1080,6 +1165,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         flags: i32,
         key_data: &[u8],
     ) -> binder::Result<KeyMetadata> {
+        crate::attest_spoof::ks_trace("importKey", ThreadState::get_calling_uid());
         let _wp = self.watch("IKeystoreSecurityLevel::importKey");
         let result = self.import_key(key, attestation_key, params, flags, key_data);
         log_key_creation_event_stats(self.security_level, params, &result);
@@ -1094,6 +1180,7 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         params: &[KeyParameter],
         authenticators: &[AuthenticatorSpec],
     ) -> binder::Result<KeyMetadata> {
+        crate::attest_spoof::ks_trace("importWrappedKey", ThreadState::get_calling_uid());
         let _wp = self.watch("IKeystoreSecurityLevel::importWrappedKey");
         let result =
             self.import_wrapped_key(key, wrapping_key, masking_key, params, authenticators);
@@ -1105,10 +1192,12 @@ impl IKeystoreSecurityLevel for KeystoreSecurityLevel {
         &self,
         storage_key: &KeyDescriptor,
     ) -> binder::Result<EphemeralStorageKeyResponse> {
+        crate::attest_spoof::ks_trace("convertStorageKeyToEphemeral", ThreadState::get_calling_uid());
         let _wp = self.watch("IKeystoreSecurityLevel::convertStorageKeyToEphemeral");
         self.convert_storage_key_to_ephemeral(storage_key).map_err(into_logged_binder)
     }
     fn deleteKey(&self, key: &KeyDescriptor) -> binder::Result<()> {
+        crate::attest_spoof::ks_trace("SecLvl::deleteKey", ThreadState::get_calling_uid());
         let _wp = self.watch("IKeystoreSecurityLevel::deleteKey");
         let result = self.delete_key(key);
         log_key_deleted(key, ThreadState::get_calling_uid(), result.is_ok());

@@ -166,7 +166,7 @@ impl KeystoreService {
             None
         };
 
-        Ok(KeyEntryResponse {
+        let mut key_entry_response = KeyEntryResponse {
             iSecurityLevel: i_sec_level,
             metadata: KeyMetadata {
                 key: KeyDescriptor {
@@ -185,7 +185,11 @@ impl KeystoreService {
                     .context(ks_err!("Trying to get creation date."))?,
                 authorizations: key_parameters_to_authorizations(key_entry.into_key_parameters()),
             },
-        })
+        };
+        // FundamentalOS: hack the retrieved attestation cert + authorizations on read-back, so keys
+        // fetched via KeyStore.getCertificateChain()/getKeyEntry are patched too (matches TSOSS).
+        crate::attest_spoof::hack_key_entry(caller_uid.0 as u32, &mut key_entry_response.metadata);
+        Ok(key_entry_response)
     }
 
     fn update_subcomponent(
@@ -403,12 +407,16 @@ impl IKeystoreService for KeystoreService {
         &self,
         security_level: SecurityLevel,
     ) -> binder::Result<Strong<dyn IKeystoreSecurityLevel>> {
+        crate::attest_spoof::ks_trace(&format!("getSecurityLevel(level={})", security_level.0), ThreadState::get_calling_uid());
         let _wp = wd::watch_millis_with("IKeystoreService::getSecurityLevel", 500, security_level);
         self.get_security_level(security_level).map_err(into_logged_binder)
     }
     fn getKeyEntry(&self, key: &KeyDescriptor) -> binder::Result<KeyEntryResponse> {
+        crate::attest_spoof::ks_trace(&format!("getKeyEntry(domain={}, nspace={}, alias={:?})", key.domain.0, key.nspace, key.alias), ThreadState::get_calling_uid());
         let _wp = wd::watch("IKeystoreService::get_key_entry");
-        self.get_key_entry(key).map_err(into_logged_binder)
+        let r = self.get_key_entry(key);
+        crate::attest_spoof::ks_trace(&format!("  -> getKeyEntry result ok={}", r.is_ok()), ThreadState::get_calling_uid());
+        r.map_err(into_logged_binder)
     }
     fn updateSubcomponent(
         &self,
@@ -416,14 +424,17 @@ impl IKeystoreService for KeystoreService {
         public_cert: Option<&[u8]>,
         certificate_chain: Option<&[u8]>,
     ) -> binder::Result<()> {
+        crate::attest_spoof::ks_trace("updateSubcomponent", ThreadState::get_calling_uid());
         let _wp = wd::watch("IKeystoreService::updateSubcomponent");
         self.update_subcomponent(key, public_cert, certificate_chain).map_err(into_logged_binder)
     }
     fn listEntries(&self, domain: Domain, namespace: i64) -> binder::Result<Vec<KeyDescriptor>> {
+        crate::attest_spoof::ks_trace("listEntries", ThreadState::get_calling_uid());
         let _wp = wd::watch("IKeystoreService::listEntries");
         self.list_entries(domain, namespace).map_err(into_logged_binder)
     }
     fn deleteKey(&self, key: &KeyDescriptor) -> binder::Result<()> {
+        crate::attest_spoof::ks_trace("deleteKey", ThreadState::get_calling_uid());
         let _wp = wd::watch("IKeystoreService::deleteKey");
         let result = self.delete_key(key);
         log_key_deleted(key, ThreadState::get_calling_uid(), result.is_ok());
@@ -435,11 +446,13 @@ impl IKeystoreService for KeystoreService {
         grantee_uid: i32,
         access_vector: i32,
     ) -> binder::Result<KeyDescriptor> {
+        crate::attest_spoof::ks_trace("grant", ThreadState::get_calling_uid());
         let grantee_uid = AppUid(grantee_uid as i64);
         let _wp = wd::watch("IKeystoreService::grant");
         self.grant(key, grantee_uid, access_vector.into()).map_err(into_logged_binder)
     }
     fn ungrant(&self, key: &KeyDescriptor, grantee_uid: i32) -> binder::Result<()> {
+        crate::attest_spoof::ks_trace("ungrant", ThreadState::get_calling_uid());
         let grantee_uid = AppUid(grantee_uid as i64);
         let _wp = wd::watch("IKeystoreService::ungrant");
         self.ungrant(key, grantee_uid).map_err(into_logged_binder)
@@ -450,16 +463,19 @@ impl IKeystoreService for KeystoreService {
         namespace: i64,
         start_past_alias: Option<&str>,
     ) -> binder::Result<Vec<KeyDescriptor>> {
+        crate::attest_spoof::ks_trace("listEntriesBatched", ThreadState::get_calling_uid());
         let _wp = wd::watch("IKeystoreService::listEntriesBatched");
         self.list_entries_batched(domain, namespace, start_past_alias).map_err(into_logged_binder)
     }
 
     fn getNumberOfEntries(&self, domain: Domain, namespace: i64) -> binder::Result<i32> {
+        crate::attest_spoof::ks_trace("getNumberOfEntries", ThreadState::get_calling_uid());
         let _wp = wd::watch("IKeystoreService::getNumberOfEntries");
         self.count_num_entries(domain, namespace).map_err(into_logged_binder)
     }
 
     fn getSupplementaryAttestationInfo(&self, tag: Tag) -> binder::Result<Vec<u8>> {
+        crate::attest_spoof::ks_trace(&format!("getSupplementaryAttestationInfo(tag={tag:?})"), ThreadState::get_calling_uid());
         let _wp = wd::watch("IKeystoreService::getSupplementaryAttestationInfo");
         self.get_supplementary_attestation_info(tag).map_err(into_logged_binder)
     }

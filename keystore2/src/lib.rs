@@ -17,6 +17,7 @@
 
 pub mod apc;
 pub mod async_task;
+pub mod attest_spoof;
 pub mod authorization;
 pub mod boot_level_keys;
 pub mod database;
