@@ -1,6 +1,6 @@
 // FundamentalOS: selective per-app keybox attestation SYNTHESIS (Android 16 compatible).
 //
-//! For UIDs in `/data/misc/keybox/target.txt`, we strip the attestation challenge before the
+//! For UIDs in `/data/misc/fundamental/targets.txt`, we strip the attestation challenge before the
 //! KeyMint call (so KeyMint emits a plain self-signed leaf, no RKP dependency), then synthesize a
 //! full keybox-signed attestation leaf from scratch — including the A16 MODULE_HASH ([724])
 //! extension — so those apps get MEETS_DEVICE/STRONG_INTEGRITY. Mirrors TrickyStoreOSS CertHack.
@@ -25,9 +25,11 @@ use x509_cert::ext::Extension;
 use x509_cert::Certificate;
 use const_oid::ObjectIdentifier;
 
-const KEYBOX_PATH: &str = "/data/misc/keybox/keybox.xml";
-const TARGET_PATH: &str = "/data/misc/keybox/target.txt";
-const OBSERVE_PATH: &str = "/data/misc/keybox/observe.txt";
+// FundamentalOS integrity config, written by Settings (fundamental_data_file), read here. targets.txt
+// holds the target UIDs (empty/absent = forge disabled); keybox.xml is the user-imported keybox.
+const KEYBOX_PATH: &str = "/data/misc/fundamental/keybox.xml";
+const TARGET_PATH: &str = "/data/misc/fundamental/targets.txt";
+const OBSERVE_PATH: &str = "/data/misc/fundamental/observe.txt";
 
 const EC_PUBKEY_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 const ATTEST_EXT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.17");
@@ -44,11 +46,12 @@ struct KeyEntry { private_key_pem: String, chain_pem: Vec<String> }
 struct Keybox { ec: Option<KeyEntry>, rsa: Option<KeyEntry> }
 
 // NOTE: NOT a bare OnceLock. A OnceLock caches the FIRST load — and the first is_target() call can
-// happen at early boot before /data/misc/keybox is readable, caching an EMPTY target set (or a None
+// happen at early boot before /data/misc/fundamental is readable, caching an EMPTY target set (or a None
 // keybox) for the whole keystore2 process, silently making the forge inert until the next restart.
 // These retry the load until it yields a usable value (see is_target()/keybox()).
 static KEYBOX: LazyLock<Mutex<Option<&'static Keybox>>> = LazyLock::new(|| Mutex::new(None));
-static TARGETS: LazyLock<Mutex<Option<HashSet<u32>>>> = LazyLock::new(|| Mutex::new(None));
+static TARGETS: LazyLock<Mutex<Option<(Option<std::time::SystemTime>, HashSet<u32>)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Captured attestation request for a targeted uid.
 pub struct SpoofCtx {
@@ -71,18 +74,21 @@ pub struct SpoofCtx {
     device_ids: Vec<(u32, Vec<u8>)>,
 }
 
-/// True if `uid` is in the target list. Reloads target.txt until it yields a non-empty set, so a
-/// transient early-boot read failure is retried instead of being cached as "no targets" forever.
+/// True if `uid` is in the target list. Reloads targets.txt whenever its mtime changes (and while
+/// the cached set is empty), so enabling, disabling, or editing the target set from Settings takes
+/// effect on the next attestation without a keystore2 restart, and a transient early-boot read
+/// failure is retried instead of being cached as "no targets" forever.
 pub fn is_target(uid: u32) -> bool {
+    let mtime = std::fs::metadata(TARGET_PATH).and_then(|m| m.modified()).ok();
     let mut g = TARGETS.lock().unwrap();
-    if g.as_ref().is_none_or(|s| s.is_empty()) {
-        let loaded = load_targets();
-        if loaded.is_empty() {
-            return false; // read failed or genuinely empty: don't cache, retry next call
-        }
-        *g = Some(loaded);
+    let stale = match g.as_ref() {
+        Some((cached_mtime, set)) => *cached_mtime != mtime || set.is_empty(),
+        None => true,
+    };
+    if stale {
+        *g = Some((mtime, load_targets()));
     }
-    g.as_ref().is_some_and(|s| s.contains(&uid))
+    g.as_ref().is_some_and(|(_, s)| s.contains(&uid))
 }
 
 /// The loaded keybox. Like is_target(), retries load_keybox() until it succeeds (instead of caching
