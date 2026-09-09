@@ -765,7 +765,14 @@ impl KeystoreSecurityLevel {
         // FundamentalOS: keystore2's appId provider only emits GMS's current signer; rebuild it with
         // GMS's full signing history before KeyMint so the resulting attestation matches what Google
         // validates (this was the only field that differed from a TrickyStoreOSS-forged leaf).
-        let params = crate::attest_spoof::augment_app_id(&params);
+        // Gate it on the target set: an empty targets.txt means the master switch is off, and every
+        // other forge step already keys off is_target(), so leaving augment_app_id unconditional was
+        // the one path that still rewrote a request after the user disabled the forge.
+        let params = if crate::attest_spoof::is_target(caller_uid.0 as u32) {
+            crate::attest_spoof::augment_app_id(&params)
+        } else {
+            params
+        };
         let spoof_ctx = crate::attest_spoof::capture(caller_uid.0 as u32, &params);
         // FundamentalOS: device-ID attestation is rejected by real KeyMint (CANNOT_ATTEST_IDS), and
         // leaf-hacking a real key drags in the RKP-failing hardware path DroidGuard can observe.
